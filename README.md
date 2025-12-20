@@ -121,8 +121,8 @@ class ComfyUIClient:
 
 ### 🚧 In Development
 
-- [ ] Audio-reactive visual generation
-- [ ] Beat-synchronized frame generation
+- [x] Audio-reactive visual generation
+- [x] Beat-synchronized frame generation
 - [ ] Real-time preview integration
 - [ ] Custom music-specific nodes
 - [ ] Advanced LoRA blending
