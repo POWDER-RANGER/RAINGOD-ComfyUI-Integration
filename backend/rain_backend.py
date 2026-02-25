@@ -19,9 +19,10 @@ GET  /outputs/{filename} Retrieve a generated image file
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
-from dataclasses import asdict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -38,6 +39,7 @@ from .rain_backend_config import (
     QualityTier,
     config as rain_config,
 )
+from .workflow_builder import WorkflowBuilder
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -49,33 +51,34 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Application & CORS
+# CORS — driven by ALLOWED_ORIGINS environment variable
+#
+# Production:  export ALLOWED_ORIGINS="https://yourdomain.com,https://app.yourdomain.com"
+# Development: export ALLOWED_ORIGINS="http://localhost:3000"
+#              (or leave unset — defaults to localhost:3000 with a warning)
 # ---------------------------------------------------------------------------
-app = FastAPI(
-    title="RAINGOD Visual Generation API",
-    description="ComfyUI integration for the RAINGOD AI Music Kit",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "")
+if _raw_origins.strip():
+    _allow_origins: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+else:
+    # Safe development default — never silently allow everything in production
+    _allow_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    logger.warning(
+        "ALLOWED_ORIGINS env var not set — CORS restricted to %s. "
+        "Set ALLOWED_ORIGINS=<comma-separated list> for production.",
+        _allow_origins,
+    )
 
 # ---------------------------------------------------------------------------
-# ComfyUI Client (singleton per worker)
+# ComfyUI Client singleton & lifespan
 # ---------------------------------------------------------------------------
 client: ComfyUIClient | None = None
 OUTPUT_DIR = Path("outputs")
 
 
-@app.on_event("startup")
-async def startup() -> None:
+@asynccontextmanager
+async def lifespan(application: FastAPI):  # noqa: ARG001
+    """FastAPI lifespan handler — initialise and tear down the ComfyUI client."""
     global client
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     client = ComfyUIClient()
@@ -84,11 +87,29 @@ async def startup() -> None:
         rain_config.comfyui.base_url,
         rain_config.gpu_tier.value,
     )
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
+    yield
     logger.info("RAINGOD backend shutting down")
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="RAINGOD Visual Generation API",
+    description="ComfyUI integration for the RAINGOD AI Music Kit",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allow_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+)
 
 
 def _get_client() -> ComfyUIClient:
@@ -136,82 +157,9 @@ class HealthResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Helper: build a minimal txt2img workflow for ComfyUI
+# WorkflowBuilder singleton — used by /generate and /batch-generate
 # ---------------------------------------------------------------------------
-
-def _build_txt2img_workflow(
-    positive: str,
-    negative: str,
-    width: int,
-    height: int,
-    steps: int,
-    cfg: float,
-    sampler_name: str,
-    scheduler: str,
-    seed: int,
-    lora_filename: str | None = None,
-) -> dict[str, Any]:
-    """Return a minimal ComfyUI API-format workflow (node graph dict)."""
-    base: dict[str, Any] = {
-        "1": {
-            "class_type": "CheckpointLoaderSimple",
-            "inputs": {"ckpt_name": "v1-5-pruned-emaonly.safetensors"},
-        },
-        "2": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"text": positive, "clip": ["1", 1]},
-        },
-        "3": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"text": negative, "clip": ["1", 1]},
-        },
-        "4": {
-            "class_type": "EmptyLatentImage",
-            "inputs": {"width": width, "height": height, "batch_size": 1},
-        },
-        "5": {
-            "class_type": "KSampler",
-            "inputs": {
-                "model": ["1", 0],
-                "positive": ["2", 0],
-                "negative": ["3", 0],
-                "latent_image": ["4", 0],
-                "seed": seed,
-                "steps": steps,
-                "cfg": cfg,
-                "sampler_name": sampler_name,
-                "scheduler": scheduler,
-                "denoise": 1.0,
-            },
-        },
-        "6": {
-            "class_type": "VAEDecode",
-            "inputs": {"samples": ["5", 0], "vae": ["1", 2]},
-        },
-        "7": {
-            "class_type": "SaveImage",
-            "inputs": {"images": ["6", 0], "filename_prefix": "raingod"},
-        },
-    }
-
-    if lora_filename:
-        # Insert LoRA loader between checkpoint and samplers
-        base["8"] = {
-            "class_type": "LoraLoader",
-            "inputs": {
-                "model": ["1", 0],
-                "clip": ["1", 1],
-                "lora_name": lora_filename,
-                "strength_model": 0.8,
-                "strength_clip": 0.8,
-            },
-        }
-        # Re-wire sampler to use LoRA output
-        base["5"]["inputs"]["model"] = ["8", 0]
-        base["2"]["inputs"]["clip"] = ["8", 1]
-        base["3"]["inputs"]["clip"] = ["8", 1]
-
-    return base
+_workflow_builder = WorkflowBuilder()
 
 
 # ---------------------------------------------------------------------------
@@ -301,10 +249,10 @@ async def generate(
 
     sampler = SAMPLER_PRESETS[req.preset]
     resolution = RESOLUTION_PRESETS[req.resolution]
-    lora_filename = LORA_MAPPINGS[req.lora_style].filename if req.lora_style and req.lora_style in LORA_MAPPINGS else None
+    lora_cfg = LORA_MAPPINGS.get(req.lora_style) if req.lora_style else None
     seed = req.seed if req.seed is not None else int(uuid.uuid4().int % (2**32))
 
-    workflow = _build_txt2img_workflow(
+    workflow = _workflow_builder.build_txt2img(
         positive=req.prompt,
         negative=req.negative_prompt,
         width=resolution["width"],
@@ -314,7 +262,7 @@ async def generate(
         sampler_name=sampler.sampler_name,
         scheduler=sampler.scheduler,
         seed=seed,
-        lora_filename=lora_filename,
+        lora=lora_cfg,
     )
 
     try:
